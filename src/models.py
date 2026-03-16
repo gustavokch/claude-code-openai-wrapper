@@ -443,6 +443,38 @@ class AnthropicMessagesRequest(BaseModel):
     stop_sequences: Optional[List[str]] = None
     stream: Optional[bool] = False
     metadata: Optional[Dict[str, Any]] = None
+    session_id: Optional[str] = Field(default=None)
+    enable_tools: Optional[bool] = Field(default=False)
+
+    def get_sampling_instructions(self) -> Optional[str]:
+        """Generate sampling instructions based on temperature and top_p."""
+        instructions = []
+
+        if self.temperature is not None and self.temperature != 1.0:
+            if self.temperature < 0.3:
+                instructions.append(
+                    "Be highly focused and deterministic in your responses. Choose the most likely and predictable options."
+                )
+            elif self.temperature < 0.7:
+                instructions.append(
+                    "Be somewhat focused and consistent in your responses, preferring reliable and expected solutions."
+                )
+            elif self.temperature > 1.0:
+                instructions.append(
+                    "Be creative and varied in your responses, exploring different approaches and possibilities."
+                )
+
+        if self.top_p is not None and self.top_p < 1.0:
+            if self.top_p < 0.5:
+                instructions.append(
+                    "Focus on the most probable and mainstream solutions, avoiding less likely alternatives."
+                )
+            elif self.top_p < 0.9:
+                instructions.append(
+                    "Prefer well-established and common approaches over unusual ones."
+                )
+
+        return " ".join(instructions) if instructions else None
 
     def to_openai_messages(self) -> List[Message]:
         """Convert Anthropic messages to OpenAI format."""
@@ -477,3 +509,47 @@ class AnthropicMessagesResponse(BaseModel):
     stop_reason: Optional[Literal["end_turn", "max_tokens", "stop_sequence"]] = "end_turn"
     stop_sequence: Optional[str] = None
     usage: AnthropicUsage
+
+
+class AnthropicMessageStartEvent(BaseModel):
+    """Anthropic SSE message_start event."""
+
+    type: Literal["message_start"] = "message_start"
+    message: Dict[str, Any]
+
+
+class AnthropicContentBlockStartEvent(BaseModel):
+    """Anthropic SSE content_block_start event."""
+
+    type: Literal["content_block_start"] = "content_block_start"
+    index: int
+    content_block: Dict[str, Any]
+
+
+class AnthropicContentBlockDeltaEvent(BaseModel):
+    """Anthropic SSE content_block_delta event."""
+
+    type: Literal["content_block_delta"] = "content_block_delta"
+    index: int
+    delta: Dict[str, Any]
+
+
+class AnthropicContentBlockStopEvent(BaseModel):
+    """Anthropic SSE content_block_stop event."""
+
+    type: Literal["content_block_stop"] = "content_block_stop"
+    index: int
+
+
+class AnthropicMessageDeltaEvent(BaseModel):
+    """Anthropic SSE message_delta event (carries stop_reason and usage)."""
+
+    type: Literal["message_delta"] = "message_delta"
+    delta: Dict[str, Any]
+    usage: Dict[str, Any]
+
+
+class AnthropicMessageStopEvent(BaseModel):
+    """Anthropic SSE message_stop event."""
+
+    type: Literal["message_stop"] = "message_stop"

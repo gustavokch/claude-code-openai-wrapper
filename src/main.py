@@ -38,6 +38,12 @@ from src.models import (
     AnthropicMessagesResponse,
     AnthropicTextBlock,
     AnthropicUsage,
+    AnthropicMessageStartEvent,
+    AnthropicContentBlockStartEvent,
+    AnthropicContentBlockDeltaEvent,
+    AnthropicContentBlockStopEvent,
+    AnthropicMessageDeltaEvent,
+    AnthropicMessageStopEvent,
 )
 from src.claude_cli import ClaudeCodeCLI
 from src.message_adapter import MessageAdapter
@@ -601,6 +607,165 @@ async def generate_streaming_response(
         yield f"data: {json.dumps(error_chunk)}\n\n"
 
 
+async def generate_anthropic_streaming_response(
+    request: AnthropicMessagesRequest,
+    request_id: str,
+    claude_headers: Optional[Dict[str, Any]] = None,
+) -> AsyncGenerator[str, None]:
+    """Generate Anthropic SSE formatted streaming response."""
+    try:
+        # Convert messages and prepend system message
+        messages = request.to_openai_messages()
+        if request.system:
+            messages = [Message(role="system", content=request.system)] + messages
+
+        # Process messages with session management
+        all_messages, actual_session_id = session_manager.process_messages(
+            messages, request.session_id
+        )
+
+        # Convert messages to prompt
+        prompt, system_prompt = MessageAdapter.messages_to_prompt(all_messages)
+
+        # Add sampling instructions
+        sampling_instructions = request.get_sampling_instructions()
+        if sampling_instructions:
+            if system_prompt:
+                system_prompt = f"{system_prompt}\n\n{sampling_instructions}"
+            else:
+                system_prompt = sampling_instructions
+
+        # Build claude options
+        claude_options: Dict[str, Any] = {"model": request.model}
+        if claude_headers:
+            claude_options.update(claude_headers)
+
+        if claude_options.get("model"):
+            ParameterValidator.validate_model(claude_options["model"])
+
+        # Configure tools
+        if not request.enable_tools:
+            claude_options["disallowed_tools"] = CLAUDE_TOOLS
+            claude_options["max_turns"] = 1
+        else:
+            claude_options["allowed_tools"] = DEFAULT_ALLOWED_TOOLS
+            claude_options["permission_mode"] = "bypassPermissions"
+
+        # Emit message_start
+        start_event = AnthropicMessageStartEvent(
+            message={
+                "id": request_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": request.model,
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            }
+        )
+        yield f"event: message_start\ndata: {start_event.model_dump_json()}\n\n"
+
+        # Emit content_block_start
+        block_start = AnthropicContentBlockStartEvent(
+            index=0, content_block={"type": "text", "text": ""}
+        )
+        yield f"event: content_block_start\ndata: {block_start.model_dump_json()}\n\n"
+
+        chunks_buffer = []
+        content_sent = False
+
+        async for chunk in claude_cli.run_completion(
+            prompt=prompt,
+            system_prompt=system_prompt,
+            model=claude_options.get("model"),
+            max_turns=claude_options.get("max_turns", 10),
+            allowed_tools=claude_options.get("allowed_tools"),
+            disallowed_tools=claude_options.get("disallowed_tools"),
+            permission_mode=claude_options.get("permission_mode"),
+            stream=True,
+        ):
+            chunks_buffer.append(chunk)
+
+            content = None
+            if chunk.get("type") == "assistant" and "message" in chunk:
+                message = chunk["message"]
+                if isinstance(message, dict) and "content" in message:
+                    content = message["content"]
+            elif "content" in chunk and isinstance(chunk["content"], list):
+                content = chunk["content"]
+
+            if content is not None:
+                if isinstance(content, list):
+                    for block in content:
+                        if hasattr(block, "text"):
+                            raw_text = block.text
+                        elif isinstance(block, dict) and block.get("type") == "text":
+                            raw_text = block.get("text", "")
+                        else:
+                            continue
+
+                        filtered_text = MessageAdapter.filter_content(raw_text)
+                        if filtered_text and not filtered_text.isspace():
+                            delta_event = AnthropicContentBlockDeltaEvent(
+                                index=0,
+                                delta={"type": "text_delta", "text": filtered_text},
+                            )
+                            yield f"event: content_block_delta\ndata: {delta_event.model_dump_json()}\n\n"
+                            content_sent = True
+
+                elif isinstance(content, str):
+                    filtered_content = MessageAdapter.filter_content(content)
+                    if filtered_content and not filtered_content.isspace():
+                        delta_event = AnthropicContentBlockDeltaEvent(
+                            index=0,
+                            delta={"type": "text_delta", "text": filtered_content},
+                        )
+                        yield f"event: content_block_delta\ndata: {delta_event.model_dump_json()}\n\n"
+                        content_sent = True
+
+        # If no content was sent, send a minimal response
+        if not content_sent:
+            delta_event = AnthropicContentBlockDeltaEvent(
+                index=0,
+                delta={"type": "text_delta", "text": "I'm unable to provide a response at the moment."},
+            )
+            yield f"event: content_block_delta\ndata: {delta_event.model_dump_json()}\n\n"
+
+        # Emit content_block_stop
+        block_stop = AnthropicContentBlockStopEvent(index=0)
+        yield f"event: content_block_stop\ndata: {block_stop.model_dump_json()}\n\n"
+
+        # Extract and store assistant content
+        assistant_content = None
+        if chunks_buffer:
+            assistant_content = claude_cli.parse_claude_message(chunks_buffer)
+            if actual_session_id and assistant_content:
+                assistant_message = Message(role="assistant", content=assistant_content)
+                session_manager.add_assistant_response(actual_session_id, assistant_message)
+
+        # Estimate token usage
+        completion_text = assistant_content or ""
+        input_tokens = MessageAdapter.estimate_tokens(prompt)
+        output_tokens = MessageAdapter.estimate_tokens(completion_text)
+
+        # Emit message_delta
+        msg_delta = AnthropicMessageDeltaEvent(
+            delta={"type": "message_delta", "stop_reason": "end_turn", "stop_sequence": None},
+            usage={"output_tokens": output_tokens},
+        )
+        yield f"event: message_delta\ndata: {msg_delta.model_dump_json()}\n\n"
+
+        # Emit message_stop
+        msg_stop = AnthropicMessageStopEvent()
+        yield f"event: message_stop\ndata: {msg_stop.model_dump_json()}\n\n"
+
+    except Exception as e:
+        logger.error(f"Anthropic streaming error: {e}")
+        error_chunk = {"error": {"message": str(e), "type": "streaming_error"}}
+        yield f"data: {json.dumps(error_chunk)}\n\n"
+
+
 @app.post("/v1/chat/completions")
 @rate_limit_endpoint("chat")
 async def chat_completions(
@@ -783,33 +948,72 @@ async def anthropic_messages(
         }
         raise HTTPException(status_code=503, detail=error_detail)
 
+    print(f"[/v1/messages] Handler entered, model={request_body.model}", flush=True)
     try:
+        request_id = f"msg_{os.urandom(12).hex()}"
         logger.info(f"Anthropic Messages API request: model={request_body.model}")
 
-        # Convert Anthropic messages to internal format
+        # Extract Claude-specific parameters from headers
+        claude_headers = ParameterValidator.extract_claude_headers(dict(request.headers))
+
+        if request_body.stream:
+            return StreamingResponse(
+                generate_anthropic_streaming_response(request_body, request_id, claude_headers),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                },
+            )
+
+        # Non-streaming: convert messages and prepend system
         messages = request_body.to_openai_messages()
+        if request_body.system:
+            messages = [Message(role="system", content=request_body.system)] + messages
 
-        # Build prompt from messages
-        prompt_parts = []
-        for msg in messages:
-            if msg.role == "user":
-                prompt_parts.append(msg.content)
-            elif msg.role == "assistant":
-                prompt_parts.append(f"Assistant: {msg.content}")
+        # Process with session management
+        all_messages, actual_session_id = session_manager.process_messages(
+            messages, request_body.session_id
+        )
 
-        prompt = "\n\n".join(prompt_parts)
-        system_prompt = request_body.system
+        # Convert to prompt
+        prompt, system_prompt = MessageAdapter.messages_to_prompt(all_messages)
 
-        # Run Claude Code - tools enabled by default for Anthropic SDK clients
-        # (they're typically using this for agentic workflows)
+        # Add sampling instructions
+        sampling_instructions = request_body.get_sampling_instructions()
+        if sampling_instructions:
+            if system_prompt:
+                system_prompt = f"{system_prompt}\n\n{sampling_instructions}"
+            else:
+                system_prompt = sampling_instructions
+
+        # Build claude options
+        claude_options: Dict[str, Any] = {"model": request_body.model}
+        if claude_headers:
+            claude_options.update(claude_headers)
+
+        if claude_options.get("model"):
+            ParameterValidator.validate_model(claude_options["model"])
+
+        # Configure tools
+        if not request_body.enable_tools:
+            claude_options["disallowed_tools"] = CLAUDE_TOOLS
+            claude_options["max_turns"] = 1
+        else:
+            claude_options["allowed_tools"] = DEFAULT_ALLOWED_TOOLS
+            claude_options["permission_mode"] = "bypassPermissions"
+
+        # Run Claude Code
+        print(f"[/v1/messages] Calling run_completion, enable_tools={request_body.enable_tools}", flush=True)
         chunks = []
         async for chunk in claude_cli.run_completion(
             prompt=prompt,
             system_prompt=system_prompt,
-            model=request_body.model,
-            max_turns=10,
-            allowed_tools=DEFAULT_ALLOWED_TOOLS,
-            permission_mode="bypassPermissions",
+            model=claude_options.get("model"),
+            max_turns=claude_options.get("max_turns", 10),
+            allowed_tools=claude_options.get("allowed_tools"),
+            disallowed_tools=claude_options.get("disallowed_tools"),
+            permission_mode=claude_options.get("permission_mode"),
             stream=False,
         ):
             chunks.append(chunk)
@@ -820,15 +1024,18 @@ async def anthropic_messages(
         if not raw_assistant_content:
             raise HTTPException(status_code=500, detail="No response from Claude Code")
 
-        # Filter out tool usage and thinking blocks
         assistant_content = MessageAdapter.filter_content(raw_assistant_content)
+
+        # Store in session
+        if actual_session_id:
+            assistant_message = Message(role="assistant", content=assistant_content)
+            session_manager.add_assistant_response(actual_session_id, assistant_message)
 
         # Estimate tokens
         prompt_tokens = MessageAdapter.estimate_tokens(prompt)
         completion_tokens = MessageAdapter.estimate_tokens(assistant_content)
 
-        # Create Anthropic-format response
-        response = AnthropicMessagesResponse(
+        return AnthropicMessagesResponse(
             model=request_body.model,
             content=[AnthropicTextBlock(text=assistant_content)],
             stop_reason="end_turn",
@@ -837,8 +1044,6 @@ async def anthropic_messages(
                 output_tokens=completion_tokens,
             ),
         )
-
-        return response
 
     except HTTPException:
         raise

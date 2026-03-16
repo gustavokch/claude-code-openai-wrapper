@@ -186,31 +186,32 @@ class ClaudeCodeCLI:
                 elif session_id:
                     options.resume = session_id
 
-                # Run the query and yield messages
-                async for message in query(prompt=prompt, options=options):
-                    # Debug logging
-                    logger.debug(f"Raw SDK message type: {type(message)}")
-                    logger.debug(f"Raw SDK message: {message}")
+                # Run the query and yield messages (with timeout to prevent indefinite hang)
+                async with asyncio.timeout(self.timeout):
+                    async for message in query(prompt=prompt, options=options):
+                        # Debug logging
+                        logger.debug(f"Raw SDK message type: {type(message)}")
+                        logger.debug(f"Raw SDK message: {message}")
 
-                    # Convert message object to dict if needed
-                    if hasattr(message, "__dict__") and not isinstance(message, dict):
-                        # Convert object to dict for consistent handling
-                        message_dict = {}
+                        # Convert message object to dict if needed
+                        if hasattr(message, "__dict__") and not isinstance(message, dict):
+                            # Convert object to dict for consistent handling
+                            message_dict = {}
 
-                        # Get all attributes from the object
-                        for attr_name in dir(message):
-                            if not attr_name.startswith("_"):  # Skip private attributes
-                                try:
-                                    attr_value = getattr(message, attr_name)
-                                    if not callable(attr_value):  # Skip methods
-                                        message_dict[attr_name] = attr_value
-                                except Exception:
-                                    pass
+                            # Get all attributes from the object
+                            for attr_name in dir(message):
+                                if not attr_name.startswith("_"):  # Skip private attributes
+                                    try:
+                                        attr_value = getattr(message, attr_name)
+                                        if not callable(attr_value):  # Skip methods
+                                            message_dict[attr_name] = attr_value
+                                    except Exception:
+                                        pass
 
-                        logger.debug(f"Converted message dict: {message_dict}")
-                        yield message_dict
-                    else:
-                        yield message
+                            logger.debug(f"Converted message dict: {message_dict}")
+                            yield message_dict
+                        else:
+                            yield message
 
             finally:
                 # Restore original environment (if we changed anything)
