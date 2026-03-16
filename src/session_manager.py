@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from threading import Lock
@@ -16,14 +16,14 @@ class Session:
 
     session_id: str
     messages: List[Message] = field(default_factory=list)
-    created_at: datetime = field(default_factory=datetime.utcnow)
-    last_accessed: datetime = field(default_factory=datetime.utcnow)
-    expires_at: datetime = field(default_factory=lambda: datetime.utcnow() + timedelta(hours=1))
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    last_accessed: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    expires_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc) + timedelta(hours=1))
 
     def touch(self):
         """Update last accessed time and extend expiration."""
-        self.last_accessed = datetime.utcnow()
-        self.expires_at = datetime.utcnow() + timedelta(hours=1)
+        self.last_accessed = datetime.now(timezone.utc)
+        self.expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
 
     def add_messages(self, messages: List[Message]):
         """Add new messages to the session."""
@@ -36,7 +36,7 @@ class Session:
 
     def is_expired(self) -> bool:
         """Check if the session has expired."""
-        return datetime.utcnow() > self.expires_at
+        return datetime.now(timezone.utc) > self.expires_at
 
     def to_session_info(self) -> SessionInfo:
         """Convert to SessionInfo model."""
@@ -165,8 +165,8 @@ class SessionManager:
         # Session mode - get or create session and merge messages
         session = self.get_or_create_session(session_id)
 
-        # Add new messages to session
-        session.add_messages(messages)
+        # Replace session messages with client-provided history (client sends full history each request)
+        session.messages = list(messages)
 
         # Return all messages in the session for Claude
         all_messages = session.get_all_messages()

@@ -1,4 +1,5 @@
 import os
+import asyncio
 import tempfile
 import atexit
 import shutil
@@ -50,6 +51,9 @@ class ClaudeCodeCLI:
 
         # Store auth environment variables for SDK
         self.claude_env_vars = auth_manager.get_claude_code_env_vars()
+
+        # Lock to serialize concurrent requests that mutate os.environ for auth
+        self._env_lock = asyncio.Lock()
 
     async def verify_cli(self) -> bool:
         """Verify Claude Agent SDK is working and authenticated."""
@@ -106,6 +110,41 @@ class ClaudeCodeCLI:
         permission_mode: Optional[str] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Run Claude Agent using the Python SDK and yield response chunks."""
+
+        # Serialize concurrent requests that mutate os.environ for auth env vars.
+        # The lock must wrap the entire SDK call because the subprocess inherits the
+        # environment at spawn time; releasing it before the call completes would let
+        # another request overwrite the vars. Requests without auth env vars bypass
+        # the lock and remain fully concurrent.
+        if self.claude_env_vars:
+            async with self._env_lock:
+                async for chunk in self._run_completion_inner(
+                    prompt, system_prompt, model, max_turns,
+                    allowed_tools, disallowed_tools, session_id,
+                    continue_session, permission_mode,
+                ):
+                    yield chunk
+        else:
+            async for chunk in self._run_completion_inner(
+                prompt, system_prompt, model, max_turns,
+                allowed_tools, disallowed_tools, session_id,
+                continue_session, permission_mode,
+            ):
+                yield chunk
+
+    async def _run_completion_inner(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        model: Optional[str] = None,
+        max_turns: int = 10,
+        allowed_tools: Optional[List[str]] = None,
+        disallowed_tools: Optional[List[str]] = None,
+        session_id: Optional[str] = None,
+        continue_session: bool = False,
+        permission_mode: Optional[str] = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Inner implementation of run_completion, called with env lock held if needed."""
 
         try:
             # Set authentication environment variables (if any)
@@ -165,7 +204,7 @@ class ClaudeCodeCLI:
                                     attr_value = getattr(message, attr_name)
                                     if not callable(attr_value):  # Skip methods
                                         message_dict[attr_name] = attr_value
-                                except:
+                                except Exception:
                                     pass
 
                         logger.debug(f"Converted message dict: {message_dict}")

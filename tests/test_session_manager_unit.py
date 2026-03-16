@@ -7,7 +7,7 @@ These are pure unit tests that don't require a running server.
 """
 
 import pytest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 import asyncio
 
@@ -30,7 +30,7 @@ class TestSession:
     def test_session_expiry_in_future(self):
         """Newly created session expires in the future."""
         session = Session(session_id="test-123")
-        assert session.expires_at > datetime.utcnow()
+        assert session.expires_at > datetime.now(timezone.utc)
 
     def test_touch_updates_last_accessed(self):
         """touch() updates last_accessed time."""
@@ -101,7 +101,7 @@ class TestSession:
 
     def test_is_expired_true_for_past_expiry(self):
         """Session with past expiry is expired."""
-        session = Session(session_id="test-123", expires_at=datetime.utcnow() - timedelta(hours=1))
+        session = Session(session_id="test-123", expires_at=datetime.now(timezone.utc) - timedelta(hours=1))
         assert session.is_expired() is True
 
     def test_to_session_info_returns_correct_model(self):
@@ -156,7 +156,7 @@ class TestSessionManager:
         session1 = manager.get_or_create_session("expiring")
         session1.add_messages([Message(role="user", content="Old")])
         # Expire AFTER adding messages (add_messages calls touch() which extends expiry)
-        session1.expires_at = datetime.utcnow() - timedelta(hours=1)
+        session1.expires_at = datetime.now(timezone.utc) - timedelta(hours=1)
 
         # Should get a new session since the old one is expired
         session2 = manager.get_or_create_session("expiring")
@@ -179,7 +179,7 @@ class TestSessionManager:
     def test_get_session_returns_none_for_expired(self, manager):
         """get_session() returns None and cleans up expired session."""
         session = manager.get_or_create_session("expiring")
-        session.expires_at = datetime.utcnow() - timedelta(hours=1)
+        session.expires_at = datetime.now(timezone.utc) - timedelta(hours=1)
 
         result = manager.get_session("expiring")
 
@@ -217,7 +217,7 @@ class TestSessionManager:
         """list_sessions() excludes and cleans up expired sessions."""
         manager.get_or_create_session("active")
         expired = manager.get_or_create_session("expired")
-        expired.expires_at = datetime.utcnow() - timedelta(hours=1)
+        expired.expires_at = datetime.now(timezone.utc) - timedelta(hours=1)
 
         sessions = manager.list_sessions()
 
@@ -234,7 +234,7 @@ class TestSessionManager:
         assert session_id is None
 
     def test_process_messages_session_mode(self, manager):
-        """process_messages() in session mode accumulates messages."""
+        """process_messages() in session mode replaces history with client-provided messages."""
         msg1 = Message(role="user", content="First")
         msg2 = Message(role="user", content="Second")
 
@@ -243,8 +243,8 @@ class TestSessionManager:
         assert len(result1) == 1
         assert sid1 == "my-session"
 
-        # Second call - should have both messages
-        result2, sid2 = manager.process_messages([msg2], session_id="my-session")
+        # Second call - client sends full history (both messages)
+        result2, sid2 = manager.process_messages([msg1, msg2], session_id="my-session")
         assert len(result2) == 2
         assert sid2 == "my-session"
 
@@ -274,7 +274,7 @@ class TestSessionManager:
 
         # Create expired session
         expired = manager.get_or_create_session("expired")
-        expired.expires_at = datetime.utcnow() - timedelta(hours=1)
+        expired.expires_at = datetime.now(timezone.utc) - timedelta(hours=1)
 
         stats = manager.get_stats()
 
@@ -296,7 +296,7 @@ class TestSessionManager:
         """_cleanup_expired_sessions() removes only expired sessions."""
         manager.get_or_create_session("active")
         expired = manager.get_or_create_session("expired")
-        expired.expires_at = datetime.utcnow() - timedelta(hours=1)
+        expired.expires_at = datetime.now(timezone.utc) - timedelta(hours=1)
 
         manager._cleanup_expired_sessions()
 

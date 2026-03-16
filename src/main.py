@@ -51,7 +51,8 @@ from src.rate_limiter import (
     rate_limit_exceeded_handler,
     rate_limit_endpoint,
 )
-from src.constants import CLAUDE_MODELS, CLAUDE_TOOLS, DEFAULT_ALLOWED_TOOLS
+from src.constants import CLAUDE_MODELS, CLAUDE_TOOLS, DEFAULT_ALLOWED_TOOLS, DEFAULT_MODEL
+from src import __version__
 
 # Load environment variables
 load_dotenv()
@@ -202,7 +203,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Claude Code OpenAI API Wrapper",
     description="OpenAI-compatible API for Claude Code",
-    version="1.0.0",
+    version=__version__,
     lifespan=lifespan,
 )
 
@@ -298,7 +299,7 @@ class DebugLoggingMiddleware(BaseHTTPMiddleware):
                                 f"🔍 Request body: {json_lib.dumps(parsed_body, indent=2)}"
                             )
                             body_logged = True
-                        except:
+                        except Exception:
                             logger.debug(f"🔍 Request body (raw): {body.decode()[:500]}...")
                             body_logged = True
             except Exception as e:
@@ -360,7 +361,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
             body = await request.body()
             if body:
                 debug_info["raw_request_body"] = body.decode()
-        except:
+        except Exception:
             debug_info["raw_request_body"] = "Could not read request body"
 
     error_response = {
@@ -409,11 +410,6 @@ async def generate_streaming_response(
             else:
                 system_prompt = sampling_instructions
             logger.debug(f"Added sampling instructions: {sampling_instructions}")
-
-        # Filter content for unsupported features
-        prompt = MessageAdapter.filter_content(prompt)
-        if system_prompt:
-            system_prompt = MessageAdapter.filter_content(system_prompt)
 
         # Get Claude Agent SDK options from request
         claude_options = request.to_claude_options()
@@ -803,11 +799,6 @@ async def anthropic_messages(
 
         prompt = "\n\n".join(prompt_parts)
         system_prompt = request_body.system
-
-        # Filter content
-        prompt = MessageAdapter.filter_content(prompt)
-        if system_prompt:
-            system_prompt = MessageAdapter.filter_content(system_prompt)
 
         # Run Claude Code - tools enabled by default for Anthropic SDK clients
         # (they're typically using this for agentic workflows)
@@ -1361,7 +1352,7 @@ async def root():
                             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"/>
                         </svg>
                     </button>
-                    <a href="https://github.com/aaronlippold/claude-code-openai-wrapper" target="_blank" rel="noopener noreferrer" class="icon-btn" title="View on GitHub">
+                    <a href="https://github.com/RichardAtCT/claude-code-openai-wrapper" target="_blank" rel="noopener noreferrer" class="icon-btn" title="View on GitHub">
                         <svg fill="currentColor" viewBox="0 0 24 24">
                             <path fill-rule="evenodd" d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z" clip-rule="evenodd"/>
                         </svg>
@@ -1581,7 +1572,7 @@ async def debug_request_validation(request: Request):
                 "validation_result": validation_result,
                 "debug_mode_enabled": DEBUG_MODE or VERBOSE,
                 "example_valid_request": {
-                    "model": "claude-3-sonnet-20240229",
+                    "model": DEFAULT_MODEL,
                     "messages": [{"role": "user", "content": "Hello, world!"}],
                     "stream": False,
                 },
@@ -1601,8 +1592,13 @@ async def debug_request_validation(request: Request):
 
 @app.get("/v1/auth/status")
 @rate_limit_endpoint("auth")
-async def get_auth_status(request: Request):
+async def get_auth_status(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
     """Get Claude Code authentication status."""
+    await verify_api_key(request, credentials)
+
     from src.auth import auth_manager
 
     auth_info = get_claude_code_auth_info()
@@ -1617,7 +1613,7 @@ async def get_auth_status(request: Request):
                 if os.getenv("API_KEY")
                 else ("runtime" if runtime_api_key else "none")
             ),
-            "version": "1.0.0",
+            "version": __version__,
         },
     }
 
