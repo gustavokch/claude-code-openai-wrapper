@@ -79,6 +79,23 @@ class ChatCompletionRequest(BaseModel):
     stream_options: Optional[StreamOptions] = Field(
         default=None, description="Options for streaming responses"
     )
+    # OpenAI reasoning_effort maps to SDK effort
+    reasoning_effort: Optional[Literal["low", "medium", "high"]] = Field(
+        default=None, description="Reasoning effort level (maps to SDK effort)"
+    )
+    # OpenAI response_format maps to SDK output_format
+    response_format: Optional[Dict[str, Any]] = Field(
+        default=None, description="Output format specification (e.g. {'type': 'json_object'})"
+    )
+    # Budget cap in USD (SDK extension)
+    max_budget_usd: Optional[float] = Field(
+        default=None, description="Maximum cost budget in USD"
+    )
+    # Explicit thinking configuration (takes precedence over max_tokens → max_thinking_tokens)
+    thinking: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Thinking config e.g. {'type': 'enabled', 'budget_tokens': N}",
+    )
 
     @field_validator("n")
     @classmethod
@@ -104,7 +121,9 @@ class ChatCompletionRequest(BaseModel):
                 f"top_p={self.top_p} will be applied via system prompt (best-effort)"
             )
 
-        if self.max_tokens is not None or self.max_completion_tokens is not None:
+        if self.thinking is None and (
+            self.max_tokens is not None or self.max_completion_tokens is not None
+        ):
             max_val = self.max_completion_tokens or self.max_tokens
             info_messages.append(
                 f"max_tokens={max_val} will be mapped to max_thinking_tokens (best-effort)"
@@ -181,20 +200,34 @@ class ChatCompletionRequest(BaseModel):
         if self.model:
             options["model"] = self.model
 
-        # Map max_tokens to max_thinking_tokens (best effort)
-        max_token_value = self.max_completion_tokens or self.max_tokens
-        if max_token_value is not None:
-            # Claude SDK doesn't have exact token limiting, but we can try max_thinking_tokens
-            # This is approximate and may not work as expected
-            options["max_thinking_tokens"] = max_token_value
-            logger.info(
-                f"Mapped max_tokens={max_token_value} to max_thinking_tokens (approximate behavior)"
-            )
+        # thinking config (explicit, takes precedence over max_tokens mapping)
+        if self.thinking is not None:
+            options["thinking"] = self.thinking
+        else:
+            # Map max_tokens to max_thinking_tokens (best effort, deprecated but still works)
+            max_token_value = self.max_completion_tokens or self.max_tokens
+            if max_token_value is not None:
+                options["max_thinking_tokens"] = max_token_value
+                logger.info(
+                    f"Mapped max_tokens={max_token_value} to max_thinking_tokens (approximate behavior)"
+                )
 
-        # Use user field for session identification if provided
+        # reasoning_effort → effort
+        if self.reasoning_effort is not None:
+            options["effort"] = self.reasoning_effort
+
+        # response_format → output_format
+        if self.response_format is not None:
+            options["output_format"] = self.response_format
+
+        # Forward user identifier to SDK
         if self.user:
-            # Could be used for analytics/logging or session tracking
+            options["user"] = self.user
             logger.info(f"Request from user: {self.user}")
+
+        # Budget cap
+        if self.max_budget_usd is not None:
+            options["max_budget_usd"] = self.max_budget_usd
 
         return options
 

@@ -202,7 +202,7 @@ async def lifespan(app: FastAPI):
 
     # Cleanup on shutdown
     logger.info("Shutting down session manager...")
-    session_manager.shutdown()
+    await session_manager.shutdown()
 
 
 # Create FastAPI app
@@ -401,7 +401,7 @@ async def generate_streaming_response(
     """Generate SSE formatted streaming response."""
     try:
         # Process messages with session management
-        all_messages, actual_session_id = session_manager.process_messages(
+        all_messages, actual_session_id = await session_manager.process_messages(
             request.messages, request.session_id
         )
 
@@ -449,12 +449,8 @@ async def generate_streaming_response(
         async for chunk in claude_cli.run_completion(
             prompt=prompt,
             system_prompt=system_prompt,
-            model=claude_options.get("model"),
-            max_turns=claude_options.get("max_turns", 10),
-            allowed_tools=claude_options.get("allowed_tools"),
-            disallowed_tools=claude_options.get("disallowed_tools"),
-            permission_mode=claude_options.get("permission_mode"),
             stream=True,
+            claude_options=claude_options,
         ):
             chunks_buffer.append(chunk)
 
@@ -576,26 +572,40 @@ async def generate_streaming_response(
             # Store in session if applicable
             if actual_session_id and assistant_content:
                 assistant_message = Message(role="assistant", content=assistant_content)
-                session_manager.add_assistant_response(actual_session_id, assistant_message)
+                await session_manager.add_assistant_response(actual_session_id, assistant_message)
+
+        # Extract real metadata (usage + stop_reason) from SDK messages
+        metadata = claude_cli.extract_metadata(chunks_buffer)
 
         # Prepare usage data if requested
         usage_data = None
         if request.stream_options and request.stream_options.include_usage:
-            # Estimate token usage based on prompt and completion
-            completion_text = assistant_content or ""
-            token_usage = claude_cli.estimate_token_usage(prompt, completion_text, request.model)
-            usage_data = Usage(
-                prompt_tokens=token_usage["prompt_tokens"],
-                completion_tokens=token_usage["completion_tokens"],
-                total_tokens=token_usage["total_tokens"],
-            )
-            logger.debug(f"Estimated usage: {usage_data}")
+            sdk_usage = metadata.get("usage")
+            if sdk_usage and isinstance(sdk_usage, dict):
+                pt = sdk_usage.get("input_tokens", 0)
+                ct = sdk_usage.get("output_tokens", 0)
+                usage_data = Usage(
+                    prompt_tokens=pt,
+                    completion_tokens=ct,
+                    total_tokens=pt + ct,
+                )
+            else:
+                # Fall back to estimate
+                completion_text = assistant_content or ""
+                token_usage = claude_cli.estimate_token_usage(prompt, completion_text, request.model)
+                usage_data = Usage(
+                    prompt_tokens=token_usage["prompt_tokens"],
+                    completion_tokens=token_usage["completion_tokens"],
+                    total_tokens=token_usage["total_tokens"],
+                )
+            logger.debug(f"Usage: {usage_data}")
 
-        # Send final chunk with finish reason and optionally usage data
+        # Send final chunk with mapped finish_reason and optionally usage data
+        finish_reason = claude_cli.map_stop_reason_openai(metadata.get("stop_reason"))
         final_chunk = ChatCompletionStreamResponse(
             id=request_id,
             model=request.model,
-            choices=[StreamChoice(index=0, delta={}, finish_reason="stop")],
+            choices=[StreamChoice(index=0, delta={}, finish_reason=finish_reason)],  # type: ignore[arg-type]
             usage=usage_data,
         )
         yield f"data: {final_chunk.model_dump_json()}\n\n"
@@ -620,7 +630,7 @@ async def generate_anthropic_streaming_response(
             messages = [Message(role="system", content=request.system)] + messages
 
         # Process messages with session management
-        all_messages, actual_session_id = session_manager.process_messages(
+        all_messages, actual_session_id = await session_manager.process_messages(
             messages, request.session_id
         )
 
@@ -678,12 +688,8 @@ async def generate_anthropic_streaming_response(
         async for chunk in claude_cli.run_completion(
             prompt=prompt,
             system_prompt=system_prompt,
-            model=claude_options.get("model"),
-            max_turns=claude_options.get("max_turns", 10),
-            allowed_tools=claude_options.get("allowed_tools"),
-            disallowed_tools=claude_options.get("disallowed_tools"),
-            permission_mode=claude_options.get("permission_mode"),
             stream=True,
+            claude_options=claude_options,
         ):
             chunks_buffer.append(chunk)
 
@@ -742,16 +748,23 @@ async def generate_anthropic_streaming_response(
             assistant_content = claude_cli.parse_claude_message(chunks_buffer)
             if actual_session_id and assistant_content:
                 assistant_message = Message(role="assistant", content=assistant_content)
-                session_manager.add_assistant_response(actual_session_id, assistant_message)
+                await session_manager.add_assistant_response(actual_session_id, assistant_message)
 
-        # Estimate token usage
-        completion_text = assistant_content or ""
-        input_tokens = MessageAdapter.estimate_tokens(prompt)
-        output_tokens = MessageAdapter.estimate_tokens(completion_text)
+        # Use real token counts from SDK metadata when available
+        metadata = claude_cli.extract_metadata(chunks_buffer)
+        sdk_usage = metadata.get("usage")
+        if sdk_usage and isinstance(sdk_usage, dict):
+            output_tokens = sdk_usage.get("output_tokens", 0)
+        else:
+            completion_text = assistant_content or ""
+            output_tokens = MessageAdapter.estimate_tokens(completion_text)
+
+        # Real stop_reason from SDK (Anthropic format: "end_turn", "max_tokens", etc.)
+        stop_reason = metadata.get("stop_reason") or "end_turn"
 
         # Emit message_delta
         msg_delta = AnthropicMessageDeltaEvent(
-            delta={"type": "message_delta", "stop_reason": "end_turn", "stop_sequence": None},
+            delta={"type": "message_delta", "stop_reason": stop_reason, "stop_sequence": None},
             usage={"output_tokens": output_tokens},
         )
         yield f"event: message_delta\ndata: {msg_delta.model_dump_json()}\n\n"
@@ -813,7 +826,7 @@ async def chat_completions(
         else:
             # Non-streaming response
             # Process messages with session management
-            all_messages, actual_session_id = session_manager.process_messages(
+            all_messages, actual_session_id = await session_manager.process_messages(
                 request_body.messages, request_body.session_id
             )
 
@@ -867,12 +880,8 @@ async def chat_completions(
             async for chunk in claude_cli.run_completion(
                 prompt=prompt,
                 system_prompt=system_prompt,
-                model=claude_options.get("model"),
-                max_turns=claude_options.get("max_turns", 10),
-                allowed_tools=claude_options.get("allowed_tools"),
-                disallowed_tools=claude_options.get("disallowed_tools"),
-                permission_mode=claude_options.get("permission_mode"),
                 stream=False,
+                claude_options=claude_options,
             ):
                 chunks.append(chunk)
 
@@ -888,11 +897,20 @@ async def chat_completions(
             # Add assistant response to session if using session mode
             if actual_session_id:
                 assistant_message = Message(role="assistant", content=assistant_content)
-                session_manager.add_assistant_response(actual_session_id, assistant_message)
+                await session_manager.add_assistant_response(actual_session_id, assistant_message)
 
-            # Estimate tokens (rough approximation)
-            prompt_tokens = MessageAdapter.estimate_tokens(prompt)
-            completion_tokens = MessageAdapter.estimate_tokens(assistant_content)
+            # Use real token counts from SDK metadata when available
+            metadata = claude_cli.extract_metadata(chunks)
+            sdk_usage = metadata.get("usage")
+            if sdk_usage and isinstance(sdk_usage, dict):
+                prompt_tokens = sdk_usage.get("input_tokens", 0)
+                completion_tokens = sdk_usage.get("output_tokens", 0)
+            else:
+                prompt_tokens = MessageAdapter.estimate_tokens(prompt)
+                completion_tokens = MessageAdapter.estimate_tokens(assistant_content)
+
+            # Map stop_reason to OpenAI finish_reason
+            finish_reason = claude_cli.map_stop_reason_openai(metadata.get("stop_reason"))
 
             # Create response
             response = ChatCompletionResponse(
@@ -902,7 +920,7 @@ async def chat_completions(
                     Choice(
                         index=0,
                         message=Message(role="assistant", content=assistant_content),
-                        finish_reason="stop",
+                        finish_reason=finish_reason,  # type: ignore[arg-type]
                     )
                 ],
                 usage=Usage(
@@ -972,7 +990,7 @@ async def anthropic_messages(
             messages = [Message(role="system", content=request_body.system)] + messages
 
         # Process with session management
-        all_messages, actual_session_id = session_manager.process_messages(
+        all_messages, actual_session_id = await session_manager.process_messages(
             messages, request_body.session_id
         )
 
@@ -1009,12 +1027,8 @@ async def anthropic_messages(
         async for chunk in claude_cli.run_completion(
             prompt=prompt,
             system_prompt=system_prompt,
-            model=claude_options.get("model"),
-            max_turns=claude_options.get("max_turns", 10),
-            allowed_tools=claude_options.get("allowed_tools"),
-            disallowed_tools=claude_options.get("disallowed_tools"),
-            permission_mode=claude_options.get("permission_mode"),
             stream=False,
+            claude_options=claude_options,
         ):
             chunks.append(chunk)
 
@@ -1029,16 +1043,25 @@ async def anthropic_messages(
         # Store in session
         if actual_session_id:
             assistant_message = Message(role="assistant", content=assistant_content)
-            session_manager.add_assistant_response(actual_session_id, assistant_message)
+            await session_manager.add_assistant_response(actual_session_id, assistant_message)
 
-        # Estimate tokens
-        prompt_tokens = MessageAdapter.estimate_tokens(prompt)
-        completion_tokens = MessageAdapter.estimate_tokens(assistant_content)
+        # Use real token counts from SDK metadata when available
+        metadata = claude_cli.extract_metadata(chunks)
+        sdk_usage = metadata.get("usage")
+        if sdk_usage and isinstance(sdk_usage, dict):
+            prompt_tokens = sdk_usage.get("input_tokens", 0)
+            completion_tokens = sdk_usage.get("output_tokens", 0)
+        else:
+            prompt_tokens = MessageAdapter.estimate_tokens(prompt)
+            completion_tokens = MessageAdapter.estimate_tokens(assistant_content)
+
+        # Real stop_reason from SDK
+        stop_reason = metadata.get("stop_reason") or "end_turn"
 
         return AnthropicMessagesResponse(
             model=request_body.model,
             content=[AnthropicTextBlock(text=assistant_content)],
-            stop_reason="end_turn",
+            stop_reason=stop_reason,  # type: ignore[arg-type]
             usage=AnthropicUsage(
                 input_tokens=prompt_tokens,
                 output_tokens=completion_tokens,
@@ -1828,7 +1851,7 @@ async def get_session_stats(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
     """Get session manager statistics."""
-    stats = session_manager.get_stats()
+    stats = await session_manager.get_stats()
     return {
         "session_stats": stats,
         "cleanup_interval_minutes": session_manager.cleanup_interval_minutes,
@@ -1839,7 +1862,7 @@ async def get_session_stats(
 @app.get("/v1/sessions")
 async def list_sessions(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)):
     """List all active sessions."""
-    sessions = session_manager.list_sessions()
+    sessions = await session_manager.list_sessions()
     return SessionListResponse(sessions=sessions, total=len(sessions))
 
 
@@ -1848,7 +1871,7 @@ async def get_session(
     session_id: str, credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
 ):
     """Get information about a specific session."""
-    session = session_manager.get_session(session_id)
+    session = await session_manager.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
@@ -1860,7 +1883,7 @@ async def delete_session(
     session_id: str, credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
 ):
     """Delete a specific session."""
-    deleted = session_manager.delete_session(session_id)
+    deleted = await session_manager.delete_session(session_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Session not found")
 
